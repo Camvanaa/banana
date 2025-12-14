@@ -117,9 +117,59 @@ def parse_model(model: str) -> tuple[str, str]:
 
 def get_base_url(request: Request) -> str:
     """获取服务的基础 URL"""
+
     if BASE_URL:
         return BASE_URL.rstrip("/")
-    return f"{request.url.scheme}://{request.url.netloc}"
+
+    headers = request.headers
+
+    def _first(value: Optional[str]) -> Optional[str]:
+        if not value:
+            return None
+        return value.split(",")[0].strip() or None
+
+    forwarded_proto = _first(headers.get("x-forwarded-proto"))
+
+    forwarded_host = _first(headers.get("x-forwarded-host"))
+
+    forwarded_port = _first(headers.get("x-forwarded-port"))
+
+    forwarded = headers.get("forwarded")
+
+    if forwarded:
+        first_forwarded = forwarded.split(",", 1)[0]
+
+        for part in first_forwarded.split(";"):
+            key, _, value = part.strip().partition("=")
+
+            if not value:
+                continue
+
+            key = key.lower()
+            value = value.strip().strip('"')
+
+            if key == "proto" and not forwarded_proto:
+                forwarded_proto = _first(value)
+
+            elif key == "host" and not forwarded_host:
+                forwarded_host = _first(value)
+
+    proto = (forwarded_proto or request.url.scheme).strip()
+
+    host = forwarded_host or _first(headers.get("host"))
+
+    if host:
+        default_ports = {"http": "80", "https": "443"}
+
+        if forwarded_port and ":" not in host:
+            proto_key = proto.lower()
+
+            if default_ports.get(proto_key) != forwarded_port:
+                host = f"{host}:{forwarded_port}"
+
+        return f"{proto}://{host}".rstrip("/")
+
+    return f"{proto}://{request.url.netloc}".rstrip("/")
 
 
 def validate_api_key(request: Request) -> bool:

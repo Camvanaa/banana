@@ -13,9 +13,7 @@ PASSWORD = os.getenv("PASSWORD", "lehh666")
 # ========== 服务器配置 ==========
 HOST = os.getenv("HOST", "0.0.0.0")
 PORT = int(os.getenv("PORT", "6667"))
-BASE_URL = os.getenv(
-    "BASE_URL", "http://140.245.33.121:6667"
-)  # 公网访问 URL，如 https://your-domain.com
+BASE_URL = os.getenv("BASE_URL")  # 公网访问 URL，如 https://your-domain.com
 
 # ========== 图片存储配置 ==========
 IMAGE_DIR = Path(os.getenv("IMAGE_DIR", "./images"))
