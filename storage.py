@@ -131,15 +131,6 @@ class ImageStorage:
 
     @staticmethod
     def _build_upload_payloads(data: str, mime_type: str) -> Sequence[dict]:
-        data_url = f"data:{mime_type};base64,{data}"
-        payloads: list[dict] = [
-            {"image_base64": data, "mime_type": mime_type},
-            {"image": data, "mime_type": mime_type},
-            {"image": data_url, "mime_type": mime_type},
-            {"image_base64": data},
-            {"image": data_url},
-        ]
-
         metadata = {
             "success": True,
             "image_base64": data,
@@ -150,14 +141,14 @@ class ImageStorage:
 
         try:
             decoded_len = len(base64.b64decode(data, validate=True))
+
         except Exception:  # noqa: BLE001
             decoded_len = None
 
         if decoded_len is not None:
             metadata["data_length"] = decoded_len
 
-        payloads.append(metadata)
-        return payloads
+        return [metadata]
 
     @staticmethod
     def _parse_json_stream(response: httpx.Response) -> object:
