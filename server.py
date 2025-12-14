@@ -44,6 +44,8 @@ HTTP_TIMEOUT = httpx.Timeout(600.0)
 HEARTBEAT_INTERVAL_SECONDS = 10
 THINKING_CHUNK_SIZE = 100
 CONTENT_CHUNK_SIZE = 50
+MAX_RETRY_ATTEMPTS = 3
+RETRY_DELAY_SECONDS = 2
 
 
 # =========================
@@ -84,15 +86,7 @@ async def lifespan(app: FastAPI):
     app.state.background_tasks = set()
     app.state.shutdown_event = asyncio.Event()
 
-    # Setup signal handlers for graceful shutdown
-    loop = asyncio.get_running_loop()
-
-    def handle_signal(signum):
-        logger.info("收到信号 %s，开始优雅关闭...", signum)
-        app.state.shutdown_event.set()
-
-    for sig in (signal.SIGTERM, signal.SIGINT):
-        loop.add_signal_handler(sig, lambda s=sig: handle_signal(s))
+    # Don't setup custom signal handlers - let uvicorn handle shutdown
 
     try:
         yield
@@ -103,20 +97,20 @@ async def lifespan(app: FastAPI):
         # Cancel all background tasks
         if hasattr(app.state, "background_tasks"):
             tasks = list(app.state.background_tasks)
-            logger.info("取消 %d 个后台任务", len(tasks))
-            for task in tasks:
-                if not task.done():
-                    task.cancel()
-
-            # Wait for all tasks with timeout
             if tasks:
+                logger.info("取消 %d 个后台任务", len(tasks))
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+
+                # Wait for all tasks with short timeout
                 try:
                     await asyncio.wait_for(
                         asyncio.gather(*tasks, return_exceptions=True),
-                        timeout=3.0,
+                        timeout=1.0,
                     )
                 except asyncio.TimeoutError:
-                    logger.warning("部分后台任务超时未完成")
+                    logger.warning("部分后台任务超时未完成，强制退出")
 
         await image_storage.stop_cleanup_scheduler()
         logger.info("服务器已关闭")
@@ -297,8 +291,13 @@ def parse_upstream_text(text: str) -> UpstreamResult:
     return UpstreamResult(thinking=thinking, text=content, image=image_data)
 
 
-async def fetch_upstream(payload: dict) -> UpstreamResult:
-    logger.info("Fetching upstream with payload keys: %s", list(payload.keys()))
+async def fetch_upstream(payload: dict, attempt: int = 1) -> UpstreamResult:
+    logger.info(
+        "Fetching upstream (attempt %d/%d) with payload keys: %s",
+        attempt,
+        MAX_RETRY_ATTEMPTS,
+        list(payload.keys()),
+    )
     try:
         async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
             response = await client.post(
@@ -317,6 +316,20 @@ async def fetch_upstream(payload: dict) -> UpstreamResult:
                 len(response.text),
             )
             logger.debug("Upstream response preview: %s", response.text[:500])
+
+            # Log full response for short/suspicious responses
+            if len(response.text) < 10000:
+                logger.warning(
+                    "Short upstream response (length=%d, might be error): %s",
+                    len(response.text),
+                    response.text,
+                )
+            elif len(response.text) < 100000:
+                # For medium-sized responses, log more preview
+                logger.debug(
+                    "Medium response preview (1000 chars): %s", response.text[:1000]
+                )
+
             result = parse_upstream_text(response.text)
             logger.info(
                 "Parsed result - thinking: %d chars, text: %d chars, has_image: %s",
@@ -324,6 +337,53 @@ async def fetch_upstream(payload: dict) -> UpstreamResult:
                 len(result.text),
                 bool(result.image),
             )
+
+            # Check if result is empty and should retry
+            is_empty = not result.thinking and not result.text and not result.image
+
+            # Also check if we expected an image but didn't get one
+            # (if response is small and no image, something might be wrong)
+            missing_expected_image = (
+                not result.image
+                and len(response.text) < 1000000  # Less than 1MB suggests no image
+                and "imageSize" in str(payload)  # We requested image generation
+            )
+
+            if is_empty:
+                logger.error(
+                    "Empty result from upstream! Full response was: %s", response.text
+                )
+            elif missing_expected_image:
+                logger.warning(
+                    "Expected image but got none. Response length: %d. Full response: %s",
+                    len(response.text),
+                    response.text
+                    if len(response.text) < 50000
+                    else response.text[:50000] + "...[truncated]",
+                )
+
+                # Retry if we haven't exceeded max attempts
+                if attempt < MAX_RETRY_ATTEMPTS:
+                    logger.warning(
+                        "Retrying in %d seconds (attempt %d/%d)...",
+                        RETRY_DELAY_SECONDS,
+                        attempt + 1,
+                        MAX_RETRY_ATTEMPTS,
+                    )
+                    await asyncio.sleep(RETRY_DELAY_SECONDS)
+                    return await fetch_upstream(payload, attempt + 1)
+                else:
+                    logger.error(
+                        "Max retry attempts reached (%d), giving up", MAX_RETRY_ATTEMPTS
+                    )
+
+            # If no text but has thinking, use thinking as text
+            if not result.text and result.thinking:
+                logger.info("No text content, using thinking as main content")
+                result = UpstreamResult(
+                    thinking=result.thinking, text=result.thinking, image=result.image
+                )
+
             return result
     except httpx.TimeoutException as exc:
         logger.warning("Upstream request timeout: %s", exc)
@@ -421,6 +481,7 @@ async def stream_chat_response(
         )
         image_url = await persist_image(result.image)
 
+        # Send reasoning content if available
         if result.thinking:
             for chunk in chunk_text(result.thinking, THINKING_CHUNK_SIZE):
                 yield create_sse_chunk(
@@ -429,12 +490,24 @@ async def stream_chat_response(
                     )
                 )
 
+        # Send main text content
         if result.text:
             for chunk in chunk_text(result.text, CONTENT_CHUNK_SIZE):
                 yield create_sse_chunk(
                     create_delta_response(response_id, model, {"content": chunk})
                 )
+        elif not result.thinking and not image_url:
+            # No content at all - send error
+            logger.warning("Empty result from upstream")
+            yield create_sse_chunk(
+                create_delta_response(
+                    response_id,
+                    model,
+                    {"content": "[Warning] No content returned from upstream"},
+                )
+            )
 
+        # Send image if available
         if image_url:
             image_block = f"\n\n![image]({image_url})"
             yield create_sse_chunk(
