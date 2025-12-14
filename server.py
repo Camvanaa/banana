@@ -8,6 +8,7 @@ import asyncio
 import json
 import logging
 import re
+import signal
 import time
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
@@ -80,9 +81,43 @@ class UpstreamResult:
 async def lifespan(app: FastAPI):
     await image_storage.start_cleanup_scheduler()
     logger.info("服务器启动完成")
+    app.state.background_tasks = set()
+    app.state.shutdown_event = asyncio.Event()
+
+    # Setup signal handlers for graceful shutdown
+    loop = asyncio.get_running_loop()
+
+    def handle_signal(signum):
+        logger.info("收到信号 %s，开始优雅关闭...", signum)
+        app.state.shutdown_event.set()
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        loop.add_signal_handler(sig, lambda s=sig: handle_signal(s))
+
     try:
         yield
     finally:
+        logger.info("开始关闭服务器...")
+        app.state.shutdown_event.set()
+
+        # Cancel all background tasks
+        if hasattr(app.state, "background_tasks"):
+            tasks = list(app.state.background_tasks)
+            logger.info("取消 %d 个后台任务", len(tasks))
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+
+            # Wait for all tasks with timeout
+            if tasks:
+                try:
+                    await asyncio.wait_for(
+                        asyncio.gather(*tasks, return_exceptions=True),
+                        timeout=3.0,
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning("部分后台任务超时未完成")
+
         await image_storage.stop_cleanup_scheduler()
         logger.info("服务器已关闭")
 
@@ -568,10 +603,13 @@ async def chat_completions(request: Request, body: ChatCompletionRequest):
                 pass
             except Exception as exc:
                 logger.error("Upstream task error: %s", exc)
+            finally:
+                # Remove self from tracking set
+                if hasattr(request.app.state, "background_tasks"):
+                    request.app.state.background_tasks.discard(task)
 
-        if not hasattr(request.app.state, "background_tasks"):
-            request.app.state.background_tasks = set()
-        request.app.state.background_tasks.add(asyncio.create_task(cleanup_task()))
+        task = asyncio.create_task(cleanup_task())
+        request.app.state.background_tasks.add(task)
 
         return response
 
@@ -623,6 +661,6 @@ if __name__ == "__main__":
         host=HOST,
         port=PORT,
         reload=False,
-        workers=4,
+        workers=1,  # Use single worker to avoid signal handling issues
         log_level="info",
     )
