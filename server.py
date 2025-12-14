@@ -252,6 +252,7 @@ def parse_upstream_text(text: str) -> UpstreamResult:
 
 
 async def fetch_upstream(payload: dict) -> UpstreamResult:
+    logger.info("Fetching upstream with payload keys: %s", list(payload.keys()))
     try:
         async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
             response = await client.post(
@@ -313,11 +314,13 @@ async def stream_chat_response(
     upstream_future: "asyncio.Task[UpstreamResult]",
 ) -> AsyncGenerator[str, None]:
     result: Optional[UpstreamResult] = None
+    logger.info("Starting stream_chat_response for id=%s, model=%s", response_id, model)
     try:
         # Send initial chunk to establish connection
         yield create_sse_chunk(
             create_delta_response(response_id, model, {"role": "assistant"})
         )
+        logger.debug("Sent initial role chunk")
 
         while not upstream_future.done():
             try:
@@ -364,6 +367,12 @@ async def stream_chat_response(
             yield "data: [DONE]\n\n"
             return
 
+        logger.info(
+            "Processing result: thinking=%d, text=%d, has_image=%s",
+            len(result.thinking),
+            len(result.text),
+            bool(result.image),
+        )
         image_url = await persist_image(result.image)
 
         if result.thinking:
@@ -494,6 +503,16 @@ async def chat_completions(request: Request, body: ChatCompletionRequest):
     }
 
     response_id = f"chatcmpl-{int(time.time() * 1000)}"
+    logger.info(
+        "Creating upstream request for response_id: %s, model: %s",
+        response_id,
+        body.model,
+    )
+    logger.debug(
+        "Request payload: user_text=%s, images=%d",
+        user_text[:100] if user_text else "(empty)",
+        len(user_images),
+    )
     upstream_future: "asyncio.Task[UpstreamResult]" = asyncio.create_task(
         fetch_upstream(target_body)
     )
@@ -501,6 +520,7 @@ async def chat_completions(request: Request, body: ChatCompletionRequest):
     if body.stream:
 
         async def stream_wrapper():
+            logger.info("Stream wrapper started for response_id: %s", response_id)
             try:
                 async for chunk in stream_chat_response(
                     response_id, body.model, upstream_future
@@ -510,6 +530,9 @@ async def chat_completions(request: Request, body: ChatCompletionRequest):
                 logger.error("Stream wrapper caught error: %s", exc, exc_info=True)
                 raise
             finally:
+                logger.info(
+                    "Stream wrapper cleanup, upstream_done=%s", upstream_future.done()
+                )
                 if not upstream_future.done():
                     upstream_future.cancel()
 
