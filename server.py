@@ -277,53 +277,98 @@ async def stream_chat_response(
     upstream_future: "asyncio.Task[UpstreamResult]",
 ) -> AsyncGenerator[str, None]:
     try:
-        # keep the connection alive while upstream is processing
         yield create_sse_chunk(": stream-start")
 
         result: Optional[UpstreamResult] = None
+
+        shielded_future = asyncio.shield(upstream_future)
         while True:
             try:
                 result = await asyncio.wait_for(
-                    upstream_future, timeout=HEARTBEAT_INTERVAL_SECONDS
+                    shielded_future, timeout=HEARTBEAT_INTERVAL_SECONDS
                 )
+
                 break
             except asyncio.TimeoutError:
                 yield create_sse_chunk(": heartbeat")
+            except Exception as exc:
+                message = "Upstream request failed"
+                if isinstance(exc, HTTPException):
+                    detail = getattr(exc, "detail", None)
+                    if isinstance(detail, dict):
+                        message = detail.get("error", {}).get("message", message)
+                    elif detail:
+                        message = str(detail)
+                else:
+                    message = str(exc) or message
+                yield create_sse_chunk(
+                    create_delta_response(
+                        response_id,
+                        model,
+                        {"content": f"[Error] {message}"},
+                        finish_reason="error",
+                    )
+                )
+                yield "data: [DONE]\n\n"
+                return
 
         if result is None:
-            raise RuntimeError("Unexpected empty upstream result")  # pragma: no cover
-
-        image_url = await persist_image(result.image)
-
-        # Send role
-        yield create_sse_chunk(
-            create_delta_response(response_id, model, {"role": "assistant"})
-        )
-
-        for chunk in chunk_text(result.thinking, THINKING_CHUNK_SIZE):
             yield create_sse_chunk(
-                create_delta_response(response_id, model, {"reasoning_content": chunk})
+                create_delta_response(
+                    response_id,
+                    model,
+                    {"content": "[Error] Empty upstream result"},
+                    finish_reason="error",
+                )
+            )
+            yield "data: [DONE]\n\n"
+            return
+
+        try:
+            image_url = await persist_image(result.image)
+
+            yield create_sse_chunk(
+                create_delta_response(response_id, model, {"role": "assistant"})
             )
 
-        for chunk in chunk_text(result.text, CONTENT_CHUNK_SIZE):
-            yield create_sse_chunk(
-                create_delta_response(response_id, model, {"content": chunk})
-            )
+            for chunk in chunk_text(result.thinking, THINKING_CHUNK_SIZE):
+                yield create_sse_chunk(
+                    create_delta_response(
+                        response_id, model, {"reasoning_content": chunk}
+                    )
+                )
 
-        if image_url:
-            image_block = f"\n\n![image]({image_url})"
-            yield create_sse_chunk(
-                create_delta_response(response_id, model, {"content": image_block})
-            )
+            for chunk in chunk_text(result.text, CONTENT_CHUNK_SIZE):
+                yield create_sse_chunk(
+                    create_delta_response(response_id, model, {"content": chunk})
+                )
 
-        yield create_sse_chunk(
-            create_delta_response(response_id, model, {}, finish_reason="stop")
-        )
-        yield "data: [DONE]\n\n"
+            if image_url:
+                image_block = f"\n\n![image]({image_url})"
+                yield create_sse_chunk(
+                    create_delta_response(response_id, model, {"content": image_block})
+                )
+
+            yield create_sse_chunk(
+                create_delta_response(response_id, model, {}, finish_reason="stop")
+            )
+            yield "data: [DONE]\n\n"
+        except Exception as exc:
+            message = str(exc) or "Streaming response failed"
+            yield create_sse_chunk(
+                create_delta_response(
+                    response_id,
+                    model,
+                    {"content": f"[Error] {message}"},
+                    finish_reason="error",
+                )
+            )
+            yield "data: [DONE]\n\n"
     finally:
-        upstream_future.cancel()
-        with suppress(asyncio.CancelledError):
-            await upstream_future
+        if not upstream_future.done():
+            upstream_future.cancel()
+            with suppress(asyncio.CancelledError):
+                await upstream_future
 
 
 # =========================
@@ -425,7 +470,10 @@ async def chat_completions(request: Request, body: ChatCompletionRequest):
     try:
         result = await upstream_future
     finally:
-        upstream_future.cancel()
+        if not upstream_future.done():
+            upstream_future.cancel()
+            with suppress(asyncio.CancelledError):
+                await upstream_future
 
     image_url = await persist_image(result.image)
     final_content = result.text
