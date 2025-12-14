@@ -177,14 +177,36 @@ async def persist_image(image_payload: Optional[dict]) -> Optional[str]:
 
 
 def parse_upstream_text(text: str) -> UpstreamResult:
+    # Remove SSE format if present (data: {...})
+    clean_text = text.strip()
+
+    # If it's SSE format, extract the JSON payload
+    if clean_text.startswith("data:"):
+        lines = []
+        for line in clean_text.split("\n"):
+            line = line.strip()
+            if line.startswith("data:"):
+                json_part = line[5:].strip()
+                if json_part and json_part != "[DONE]":
+                    lines.append(json_part)
+
+        if lines:
+            # Try to parse as JSON array or single object
+            if len(lines) == 1:
+                clean_text = lines[0]
+            else:
+                clean_text = "[" + ",".join(lines) + "]"
+
+    # Remove keepalive comments
+    clean_text = re.sub(r"/\*\s*keepalive\s*\*/", "", clean_text).strip()
+
     try:
-        clean_text = re.sub(r"/\*\s*keepalive\s*\*/", "", text).strip()
         first_bracket = next((i for i, c in enumerate(clean_text) if c in "[{]"), -1)
         if first_bracket > 0:
             clean_text = clean_text[first_bracket:]
         payload = json.loads(clean_text)
     except json.JSONDecodeError as exc:
-        logger.error("JSON 解析错误: %s", exc)
+        logger.error("JSON 解析错误: %s (text preview: %s...)", exc, text[:200])
         payload = []
 
     if isinstance(payload, dict):
@@ -276,22 +298,19 @@ async def stream_chat_response(
     model: str,
     upstream_future: "asyncio.Task[UpstreamResult]",
 ) -> AsyncGenerator[str, None]:
+    result: Optional[UpstreamResult] = None
     try:
         yield create_sse_chunk(": stream-start")
 
-        result: Optional[UpstreamResult] = None
-
-        shielded_future = asyncio.shield(upstream_future)
-        while True:
+        while not upstream_future.done():
             try:
                 result = await asyncio.wait_for(
-                    shielded_future, timeout=HEARTBEAT_INTERVAL_SECONDS
+                    asyncio.shield(upstream_future), timeout=HEARTBEAT_INTERVAL_SECONDS
                 )
-
                 break
             except asyncio.TimeoutError:
                 yield create_sse_chunk(": heartbeat")
-            except Exception as exc:
+            except (HTTPException, Exception) as exc:
                 message = "Upstream request failed"
                 if isinstance(exc, HTTPException):
                     detail = getattr(exc, "detail", None)
@@ -301,6 +320,8 @@ async def stream_chat_response(
                         message = str(detail)
                 else:
                     message = str(exc) or message
+
+                logger.error("Stream error during upstream fetch: %s", message)
                 yield create_sse_chunk(
                     create_delta_response(
                         response_id,
@@ -313,6 +334,7 @@ async def stream_chat_response(
                 return
 
         if result is None:
+            logger.warning("Stream completed with empty result")
             yield create_sse_chunk(
                 create_delta_response(
                     response_id,
@@ -324,13 +346,13 @@ async def stream_chat_response(
             yield "data: [DONE]\n\n"
             return
 
-        try:
-            image_url = await persist_image(result.image)
+        image_url = await persist_image(result.image)
 
-            yield create_sse_chunk(
-                create_delta_response(response_id, model, {"role": "assistant"})
-            )
+        yield create_sse_chunk(
+            create_delta_response(response_id, model, {"role": "assistant"})
+        )
 
+        if result.thinking:
             for chunk in chunk_text(result.thinking, THINKING_CHUNK_SIZE):
                 yield create_sse_chunk(
                     create_delta_response(
@@ -338,37 +360,43 @@ async def stream_chat_response(
                     )
                 )
 
+        if result.text:
             for chunk in chunk_text(result.text, CONTENT_CHUNK_SIZE):
                 yield create_sse_chunk(
                     create_delta_response(response_id, model, {"content": chunk})
                 )
 
-            if image_url:
-                image_block = f"\n\n![image]({image_url})"
-                yield create_sse_chunk(
-                    create_delta_response(response_id, model, {"content": image_block})
-                )
-
+        if image_url:
+            image_block = f"\n\n![image]({image_url})"
             yield create_sse_chunk(
-                create_delta_response(response_id, model, {}, finish_reason="stop")
+                create_delta_response(response_id, model, {"content": image_block})
             )
-            yield "data: [DONE]\n\n"
-        except Exception as exc:
-            message = str(exc) or "Streaming response failed"
+
+        yield create_sse_chunk(
+            create_delta_response(response_id, model, {}, finish_reason="stop")
+        )
+        yield "data: [DONE]\n\n"
+
+    except GeneratorExit:
+        logger.info("Client disconnected during streaming")
+        raise
+    except Exception as exc:
+        logger.error("Unexpected streaming error: %s", exc, exc_info=True)
+        try:
             yield create_sse_chunk(
                 create_delta_response(
                     response_id,
                     model,
-                    {"content": f"[Error] {message}"},
+                    {"content": f"[Error] {str(exc) or 'Streaming failed'}"},
                     finish_reason="error",
                 )
             )
             yield "data: [DONE]\n\n"
+        except:
+            pass
     finally:
         if not upstream_future.done():
             upstream_future.cancel()
-            with suppress(asyncio.CancelledError):
-                await upstream_future
 
 
 # =========================
@@ -457,8 +485,22 @@ async def chat_completions(request: Request, body: ChatCompletionRequest):
     )
 
     if body.stream:
-        return StreamingResponse(
-            stream_chat_response(response_id, body.model, upstream_future),
+
+        async def stream_wrapper():
+            try:
+                async for chunk in stream_chat_response(
+                    response_id, body.model, upstream_future
+                ):
+                    yield chunk
+            except Exception as exc:
+                logger.error("Stream wrapper caught error: %s", exc, exc_info=True)
+                raise
+            finally:
+                if not upstream_future.done():
+                    upstream_future.cancel()
+
+        response = StreamingResponse(
+            stream_wrapper(),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",
@@ -467,13 +509,21 @@ async def chat_completions(request: Request, body: ChatCompletionRequest):
             },
         )
 
-    try:
-        result = await upstream_future
-    finally:
-        if not upstream_future.done():
-            upstream_future.cancel()
-            with suppress(asyncio.CancelledError):
+        async def cleanup_task():
+            try:
                 await upstream_future
+            except asyncio.CancelledError:
+                pass
+            except Exception as exc:
+                logger.error("Upstream task error: %s", exc)
+
+        request.app.state.setdefault("background_tasks", set()).add(
+            asyncio.create_task(cleanup_task())
+        )
+
+        return response
+
+    result = await upstream_future
 
     image_url = await persist_image(result.image)
     final_content = result.text
