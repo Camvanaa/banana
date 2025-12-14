@@ -15,12 +15,24 @@ HOST = os.getenv("HOST", "0.0.0.0")
 PORT = int(os.getenv("PORT", "6667"))
 BASE_URL = os.getenv("BASE_URL")  # 公网访问 URL，如 https://your-domain.com
 
+
 # ========== 图片存储配置 ==========
+
 IMAGE_DIR = Path(os.getenv("IMAGE_DIR", "./images"))
+
 IMAGE_EXPIRE_SECONDS = int(os.getenv("IMAGE_EXPIRE_SECONDS", "3600"))  # 1小时过期
+
 IMAGE_CLEANUP_INTERVAL = int(
     os.getenv("IMAGE_CLEANUP_INTERVAL", "300")
 )  # 5分钟清理一次
+
+# 远程图片存储服务配置
+REMOTE_IMAGE_BASE_URL = os.getenv(
+    "REMOTE_IMAGE_BASE_URL", "https://testu2584-image-st.hf.space"
+)
+REMOTE_IMAGE_UPLOAD_PATH = os.getenv("REMOTE_IMAGE_UPLOAD_PATH", "/upload")
+REMOTE_IMAGE_FETCH_PATH = os.getenv("REMOTE_IMAGE_FETCH_PATH", "/image/{id}")
+
 
 # ========== 模型配置 ==========
 ASPECT_RATIOS = ["auto", "21-9", "16-9", "4-3", "1-1", "3-4", "9-16", "9-21"]

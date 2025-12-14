@@ -1,179 +1,283 @@
 """
-图片存储和清理服务
+图片存储和清理服务（远程存储版）
 """
 
 import asyncio
-import base64
+import json
 import logging
 import time
-import uuid
 from dataclasses import dataclass
-from pathlib import Path
+from datetime import datetime
 from typing import Optional
+from urllib.parse import urljoin
 
-from config import IMAGE_CLEANUP_INTERVAL, IMAGE_DIR, IMAGE_EXPIRE_SECONDS
+import httpx
+
+from config import (
+    IMAGE_CLEANUP_INTERVAL,
+    IMAGE_EXPIRE_SECONDS,
+    REMOTE_IMAGE_BASE_URL,
+    REMOTE_IMAGE_FETCH_PATH,
+    REMOTE_IMAGE_UPLOAD_PATH,
+)
 
 logger = logging.getLogger(__name__)
 
 
 @dataclass
-class ImageInfo:
-    """图片信息"""
+class RemoteImageInfo:
+    """远程图片信息"""
 
     id: str
-    path: Path
+    url: str
     mime_type: str
-    created_at: float
+    expires_at: Optional[float]
 
 
 class ImageStorage:
-    """图片存储管理器"""
+    """远程图片存储管理器"""
 
-    def __init__(self):
-        self._images: dict[str, ImageInfo] = {}
+    def __init__(self) -> None:
+        self._images: dict[str, RemoteImageInfo] = {}
         self._cleanup_task: Optional[asyncio.Task] = None
+        self._client: Optional[httpx.AsyncClient] = None
 
-    def generate_id(self) -> str:
-        """生成唯一图片ID"""
-        return f"img_{int(time.time())}_{uuid.uuid4().hex[:8]}"
+    async def _get_client(self) -> httpx.AsyncClient:
+        if self._client is None:
+            self._client = httpx.AsyncClient(timeout=30.0)
+        return self._client
 
-    async def save(self, data: str, mime_type: str = "image/png") -> str:
+    @staticmethod
+    def _build_url(path: str) -> str:
+        if path.startswith("http://") or path.startswith("https://"):
+            return path
+        return urljoin(REMOTE_IMAGE_BASE_URL.rstrip("/") + "/", path.lstrip("/"))
+
+    @staticmethod
+    def _parse_expires_at(value: Optional[str]) -> Optional[float]:
+        if not value:
+            return None
+        try:
+            # HuggingFace 推送的 ISO8601，兼容 Z 结尾
+            return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            logger.debug("无法解析 expires_at: %s", value)
+            return None
+
+    @staticmethod
+    def _extract_remote_entry(
+        payload: object,
+    ) -> tuple[Optional[str], Optional[str], Optional[str]]:
         """
-        保存 base64 图片数据到本地
+        从接口返回中提取 (url, expires_at, mime_type)
+
+        兼容多种返回结构：
+        - dict，直接包含 url / expires_at
+        - list，取第一个包含 url 的元素
+        """
+        candidates: list[dict] = []
+
+        if isinstance(payload, dict):
+            candidates.append(payload)
+            for key in ("data", "result", "results", "images", "items"):
+                nested = payload.get(key)
+                if isinstance(nested, list):
+                    candidates.extend(
+                        [item for item in nested if isinstance(item, dict)]
+                    )
+                elif isinstance(nested, dict):
+                    candidates.append(nested)
+        elif isinstance(payload, list):
+            candidates.extend([item for item in payload if isinstance(item, dict)])
+
+        for candidate in candidates:
+            url = (
+                candidate.get("url")
+                or candidate.get("image_url")
+                or candidate.get("imageUrl")
+                or candidate.get("path")
+            )
+            expires_at = candidate.get("expires_at")
+            mime_type = candidate.get("mime_type") or candidate.get("content_type")
+
+            identifier = (
+                candidate.get("id")
+                or candidate.get("image_id")
+                or candidate.get("imageId")
+            )
+
+            data_field = candidate.get("data")
+            if not url and isinstance(data_field, dict):
+                url = (
+                    data_field.get("url")
+                    or data_field.get("image_url")
+                    or data_field.get("imageUrl")
+                    or data_field.get("path")
+                )
+                expires_at = expires_at or data_field.get("expires_at")
+                mime_type = (
+                    mime_type
+                    or data_field.get("mime_type")
+                    or data_field.get("content_type")
+                )
+                if not identifier:
+                    identifier = (
+                        data_field.get("id")
+                        or data_field.get("image_id")
+                        or data_field.get("imageId")
+                    )
+
+            if url:
+                return url, expires_at, mime_type
+            if identifier:
+                fallback_path = REMOTE_IMAGE_FETCH_PATH.format(id=identifier)
+                return fallback_path, expires_at, mime_type
+
+        return None, None, None
+
+    async def save(self, data: str, mime_type: str = "image/png") -> RemoteImageInfo:
+        """
+        保存 base64 图片数据到远程存储
 
         Args:
             data: base64 编码的图片数据
             mime_type: MIME 类型
 
+
         Returns:
-            图片ID
+
+            RemoteImageInfo: 远程图片信息
+
         """
-        image_id = self.generate_id()
+        upload_url = self._build_url(REMOTE_IMAGE_UPLOAD_PATH)
+        payload = {
+            "image_base64": data,
+            "mime_type": mime_type,
+        }
 
-        # 确定文件扩展名
-        ext = "png"
-        if "jpeg" in mime_type or "jpg" in mime_type:
-            ext = "jpg"
-        elif "gif" in mime_type:
-            ext = "gif"
-        elif "webp" in mime_type:
-            ext = "webp"
-
-        file_path = IMAGE_DIR / f"{image_id}.{ext}"
-
-        # 解码并保存
+        client = await self._get_client()
         try:
-            image_bytes = base64.b64decode(data)
-            file_path.write_bytes(image_bytes)
-
-            self._images[image_id] = ImageInfo(
-                id=image_id, path=file_path, mime_type=mime_type, created_at=time.time()
-            )
-
-            logger.info(f"图片已保存: {image_id}, 大小: {len(image_bytes)} 字节")
-            return image_id
-
-        except Exception as e:
-            logger.error(f"保存图片失败: {e}")
+            response = await client.post(upload_url, json=payload)
+            response.raise_for_status()
+        except httpx.HTTPError as exc:
+            logger.error("上传图片到远程服务失败: %s", exc)
             raise
 
-    def get(self, image_id: str) -> Optional[tuple[bytes, str]]:
+        try:
+            json_payload = response.json()
+        except ValueError as exc:
+            text_body = response.text
+            decoder = json.JSONDecoder()
+            fragments: list[object] = []
+            idx = 0
+            length = len(text_body)
+            while idx < length:
+                while idx < length and text_body[idx].isspace():
+                    idx += 1
+                if idx >= length:
+                    break
+                try:
+                    obj, offset = decoder.raw_decode(text_body, idx)
+                except json.JSONDecodeError:
+                    idx += 1
+                    continue
+                fragments.append(obj)
+                idx = offset
+            if fragments:
+                json_payload = fragments if len(fragments) > 1 else fragments[0]
+                logger.warning("远程服务返回非标准 JSON，已拆分解析: %s", exc)
+            else:
+                logger.error("远程服务返回非 JSON 数据: %s", exc)
+                raise
+
+        url, expires_at_raw, remote_mime = self._extract_remote_entry(json_payload)
+        if not url:
+            logger.error("远程服务返回中缺少 URL 字段: %s", json_payload)
+            raise RuntimeError("远程图片服务返回数据无效")
+
+        full_url = self._build_url(url)
+        image_id = full_url.rstrip("/").split("/")[-1]
+
+        expires_at = self._parse_expires_at(expires_at_raw)
+        if expires_at is None:
+            expires_at = time.time() + IMAGE_EXPIRE_SECONDS
+
+        info = RemoteImageInfo(
+            id=image_id,
+            url=full_url,
+            mime_type=remote_mime or mime_type,
+            expires_at=expires_at,
+        )
+        self._images[image_id] = info
+
+        logger.info(
+            "图片已上传至远程服务: %s (过期时间: %s)", image_id, expires_at_raw or "N/A"
+        )
+
+        return info
+
+    async def get(self, image_id: str) -> Optional[tuple[bytes, str]]:
         """
         获取图片数据
-
         Returns:
             (图片字节数据, MIME类型) 或 None
         """
         info = self._images.get(image_id)
+        fetch_url = (
+            info.url
+            if info
+            else self._build_url(REMOTE_IMAGE_FETCH_PATH.format(id=image_id))
+        )
 
-        if not info:
-            # 尝试从文件系统查找
-            logger.info(f"内存中未找到 {image_id}，尝试从文件系统查找: {IMAGE_DIR}")
-            found_files = list(IMAGE_DIR.glob(f"{image_id}.*"))
-            logger.info(f"找到文件: {found_files}")
-
-            for file_path in found_files:
-                if file_path.exists():
-                    mime_type = self._guess_mime_type(file_path.suffix)
-                    logger.info(f"从文件系统加载图片: {file_path}")
-                    return file_path.read_bytes(), mime_type
-
-            logger.warning(f"图片未找到: {image_id}")
+        client = await self._get_client()
+        try:
+            response = await client.get(fetch_url)
+        except httpx.HTTPError as exc:
+            logger.error("获取远程图片失败 %s: %s", image_id, exc)
             return None
 
-        if not info.path.exists():
-            del self._images[image_id]
+        if response.status_code != 200:
+            logger.warning(
+                "远程图片未找到或已过期 %s，状态码: %s", image_id, response.status_code
+            )
+            if image_id in self._images:
+                del self._images[image_id]
             return None
 
-        return info.path.read_bytes(), info.mime_type
+        content_type = response.headers.get("content-type", "image/png")
+        if info and content_type != info.mime_type:
+            info.mime_type = content_type
+        return response.content, content_type
 
-    def _guess_mime_type(self, suffix: str) -> str:
-        """根据扩展名猜测MIME类型"""
-        mapping = {
-            ".png": "image/png",
-            ".jpg": "image/jpeg",
-            ".jpeg": "image/jpeg",
-            ".gif": "image/gif",
-            ".webp": "image/webp",
-        }
-        return mapping.get(suffix.lower(), "image/png")
-
-    async def cleanup_expired(self):
-        """清理过期图片"""
+    async def cleanup_expired(self) -> None:
+        """清理远程已过期的缓存映射"""
         now = time.time()
-        expired_ids = []
-
-        for image_id, info in list(self._images.items()):
-            if now - info.created_at > IMAGE_EXPIRE_SECONDS:
-                expired_ids.append(image_id)
-                try:
-                    if info.path.exists():
-                        info.path.unlink()
-                        logger.info(f"已删除过期图片: {image_id}")
-                except Exception as e:
-                    logger.error(f"删除图片失败 {image_id}: {e}")
-
-        for image_id in expired_ids:
+        expired = [
+            image_id
+            for image_id, info in self._images.items()
+            if info.expires_at is not None and now > info.expires_at
+        ]
+        for image_id in expired:
             del self._images[image_id]
+        if expired:
+            logger.info("清理了 %d 个远程图片缓存映射", len(expired))
 
-        # 同时清理文件系统中的孤立文件
-        await self._cleanup_orphan_files()
-
-        if expired_ids:
-            logger.info(f"清理了 {len(expired_ids)} 个过期图片")
-
-    async def _cleanup_orphan_files(self):
-        """清理文件系统中的孤立文件（超过过期时间的）"""
-        now = time.time()
-        for file_path in IMAGE_DIR.glob("img_*.*"):
-            try:
-                # 从文件名解析时间戳
-                parts = file_path.stem.split("_")
-                if len(parts) >= 2:
-                    created_ts = int(parts[1])
-                    if now - created_ts > IMAGE_EXPIRE_SECONDS:
-                        file_path.unlink()
-                        logger.info(f"已删除孤立文件: {file_path.name}")
-            except (ValueError, IndexError):
-                continue
-            except Exception as e:
-                logger.error(f"清理孤立文件失败 {file_path}: {e}")
-
-    async def start_cleanup_scheduler(self):
+    async def start_cleanup_scheduler(self) -> None:
         """启动定期清理任务"""
 
-        async def _scheduler():
+        async def _scheduler() -> None:
             while True:
                 await asyncio.sleep(IMAGE_CLEANUP_INTERVAL)
                 try:
                     await self.cleanup_expired()
-                except Exception as e:
-                    logger.error(f"定期清理失败: {e}")
+                except Exception as exc:  # noqa: BLE001
+                    logger.error("定期清理失败: %s", exc)
 
-        self._cleanup_task = asyncio.create_task(_scheduler())
-        logger.info(f"图片清理调度器已启动，间隔: {IMAGE_CLEANUP_INTERVAL}秒")
+        if self._cleanup_task is None or self._cleanup_task.done():
+            self._cleanup_task = asyncio.create_task(_scheduler())
+            logger.info("图片清理调度器已启动，间隔: %s秒", IMAGE_CLEANUP_INTERVAL)
 
-    async def stop_cleanup_scheduler(self):
+    async def stop_cleanup_scheduler(self) -> None:
         """停止定期清理任务"""
         if self._cleanup_task:
             self._cleanup_task.cancel()
@@ -181,7 +285,12 @@ class ImageStorage:
                 await self._cleanup_task
             except asyncio.CancelledError:
                 pass
+            self._cleanup_task = None
             logger.info("图片清理调度器已停止")
+
+        if self._client:
+            await self._client.aclose()
+            self._client = None
 
 
 # 全局实例

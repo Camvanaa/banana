@@ -317,7 +317,7 @@ async def list_models():
 @app.get("/v1/images/{image_id}")
 async def get_image(image_id: str):
     """获取存储的图片"""
-    result = image_storage.get(image_id)
+    result = await image_storage.get(image_id)
     if not result:
         raise HTTPException(status_code=404, detail="Image not found or expired")
 
@@ -335,7 +335,6 @@ async def get_image(image_id: str):
 @app.post("/v1/chat/completions", dependencies=[Depends(require_api_key)])
 async def chat_completions(request: Request, body: ChatCompletionRequest):
     """聊天补全接口"""
-    base_url = get_base_url(request)
 
     # 提取用户消息
     user_text = ""
@@ -436,10 +435,10 @@ async def chat_completions(request: Request, body: ChatCompletionRequest):
     image_url = None
     if image_data:
         try:
-            image_id = await image_storage.save(
+            remote_info = await image_storage.save(
                 image_data["data"], image_data["mime_type"]
             )
-            image_url = f"{base_url}/v1/images/{image_id}"
+            image_url = remote_info.url
         except Exception as e:
             logger.error(f"保存图片失败: {e}")
 
