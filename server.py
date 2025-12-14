@@ -206,7 +206,8 @@ def parse_upstream_text(text: str) -> UpstreamResult:
             clean_text = clean_text[first_bracket:]
         payload = json.loads(clean_text)
     except json.JSONDecodeError as exc:
-        logger.error("JSON 解析错误: %s (text preview: %s...)", exc, text[:200])
+        logger.error("JSON 解析错误: %s", exc)
+        logger.error("Failed text preview: %s", text[:500])
         payload = []
 
     if isinstance(payload, dict):
@@ -263,7 +264,20 @@ async def fetch_upstream(payload: dict) -> UpstreamResult:
                 },
             )
             response.raise_for_status()
-            return parse_upstream_text(response.text)
+            logger.info(
+                "Upstream response status: %s, length: %d",
+                response.status_code,
+                len(response.text),
+            )
+            logger.debug("Upstream response preview: %s", response.text[:500])
+            result = parse_upstream_text(response.text)
+            logger.info(
+                "Parsed result - thinking: %d chars, text: %d chars, has_image: %s",
+                len(result.thinking),
+                len(result.text),
+                bool(result.image),
+            )
+            return result
     except httpx.TimeoutException as exc:
         logger.warning("Upstream request timeout: %s", exc)
         raise HTTPException(
