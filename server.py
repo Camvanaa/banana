@@ -30,6 +30,10 @@ from config import (
 )
 from storage import image_storage
 
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
 logger = logging.getLogger(__name__)
 
 
@@ -126,14 +130,20 @@ def parse_model(model: str) -> tuple[str, str]:
 
 def validate_api_key(request: Request) -> bool:
     auth_header = request.headers.get("Authorization", "")
+    logger.info("API Key validation - has auth header: %s", bool(auth_header))
     if not auth_header.startswith("Bearer "):
+        logger.warning("API Key validation failed - invalid format")
         return False
     token = auth_header[7:]
-    return token == API_KEY
+    is_valid = token == API_KEY
+    logger.info("API Key validation result: %s", is_valid)
+    return is_valid
 
 
 async def require_api_key(request: Request):
+    logger.info("require_api_key called for path: %s", request.url.path)
     if not validate_api_key(request):
+        logger.error("API Key validation failed - raising 401")
         raise HTTPException(
             status_code=401,
             detail={
@@ -143,6 +153,7 @@ async def require_api_key(request: Request):
                 }
             },
         )
+    logger.info("API Key validation passed")
 
 
 def create_sse_chunk(data: dict | str) -> str:
@@ -455,6 +466,10 @@ async def get_image(image_id: str):
 
 @app.post("/v1/chat/completions", dependencies=[Depends(require_api_key)])
 async def chat_completions(request: Request, body: ChatCompletionRequest):
+    logger.info("=== CHAT COMPLETIONS REQUEST RECEIVED ===")
+    logger.info("Model: %s, Stream: %s", body.model, body.stream)
+    logger.info("Messages count: %d", len(body.messages))
+
     # Extract user text and images
     user_text = ""
     user_images: list[str] = []
