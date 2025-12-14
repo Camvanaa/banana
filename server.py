@@ -300,7 +300,10 @@ async def stream_chat_response(
 ) -> AsyncGenerator[str, None]:
     result: Optional[UpstreamResult] = None
     try:
-        yield create_sse_chunk(": stream-start")
+        # Send initial chunk to establish connection
+        yield create_sse_chunk(
+            create_delta_response(response_id, model, {"role": "assistant"})
+        )
 
         while not upstream_future.done():
             try:
@@ -309,7 +312,8 @@ async def stream_chat_response(
                 )
                 break
             except asyncio.TimeoutError:
-                yield create_sse_chunk(": heartbeat")
+                # Send empty chunk as keepalive
+                yield create_sse_chunk(create_delta_response(response_id, model, {}))
             except (HTTPException, Exception) as exc:
                 message = "Upstream request failed"
                 if isinstance(exc, HTTPException):
@@ -347,10 +351,6 @@ async def stream_chat_response(
             return
 
         image_url = await persist_image(result.image)
-
-        yield create_sse_chunk(
-            create_delta_response(response_id, model, {"role": "assistant"})
-        )
 
         if result.thinking:
             for chunk in chunk_text(result.thinking, THINKING_CHUNK_SIZE):
