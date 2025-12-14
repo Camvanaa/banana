@@ -1,14 +1,15 @@
-"""
-图片存储和清理服务（远程存储版）
-"""
+"""Remote image storage helper with upload retries and background cleanup."""
+
+from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
 import time
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Optional
+from typing import Iterable, Optional, Sequence
 from urllib.parse import urljoin
 
 import httpx
@@ -24,9 +25,9 @@ from config import (
 logger = logging.getLogger(__name__)
 
 
-@dataclass
+@dataclass(slots=True)
 class RemoteImageInfo:
-    """远程图片信息"""
+    """Metadata for an image stored on the remote service."""
 
     id: str
     url: str
@@ -35,11 +36,11 @@ class RemoteImageInfo:
 
 
 class ImageStorage:
-    """远程图片存储管理器"""
+    """Manage remote image uploads and cached references."""
 
     def __init__(self) -> None:
         self._images: dict[str, RemoteImageInfo] = {}
-        self._cleanup_task: Optional[asyncio.Task] = None
+        self._cleanup_task: Optional[asyncio.Task[None]] = None
         self._client: Optional[httpx.AsyncClient] = None
 
     async def _get_client(self) -> httpx.AsyncClient:
@@ -49,48 +50,42 @@ class ImageStorage:
 
     @staticmethod
     def _build_url(path: str) -> str:
-        if path.startswith("http://") or path.startswith("https://"):
+        if path.startswith(("http://", "https://")):
             return path
-        return urljoin(REMOTE_IMAGE_BASE_URL.rstrip("/") + "/", path.lstrip("/"))
+        base = REMOTE_IMAGE_BASE_URL.rstrip("/") + "/"
+        return urljoin(base, path.lstrip("/"))
 
     @staticmethod
-    def _parse_expires_at(value: Optional[str]) -> Optional[float]:
-        if not value:
+    def _parse_expires_at(raw: Optional[str]) -> Optional[float]:
+        if not raw:
             return None
         try:
-            # HuggingFace 推送的 ISO8601，兼容 Z 结尾
-            return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+            normalized = raw.replace("Z", "+00:00")
+            return datetime.fromisoformat(normalized).timestamp()
         except ValueError:
-            logger.debug("无法解析 expires_at: %s", value)
+            logger.debug("Unable to parse expires_at value: %s", raw)
             return None
+
+    @staticmethod
+    def _candidate_dicts(payload: object) -> Iterable[dict]:
+        if isinstance(payload, dict):
+            yield payload
+            for key in ("data", "result", "results", "images", "items"):
+                nested = payload.get(key)
+                if isinstance(nested, dict):
+                    yield from ImageStorage._candidate_dicts(nested)
+                elif isinstance(nested, list):
+                    for item in nested:
+                        yield from ImageStorage._candidate_dicts(item)
+        elif isinstance(payload, list):
+            for item in payload:
+                yield from ImageStorage._candidate_dicts(item)
 
     @staticmethod
     def _extract_remote_entry(
         payload: object,
     ) -> tuple[Optional[str], Optional[str], Optional[str]]:
-        """
-        从接口返回中提取 (url, expires_at, mime_type)
-
-        兼容多种返回结构：
-        - dict，直接包含 url / expires_at
-        - list，取第一个包含 url 的元素
-        """
-        candidates: list[dict] = []
-
-        if isinstance(payload, dict):
-            candidates.append(payload)
-            for key in ("data", "result", "results", "images", "items"):
-                nested = payload.get(key)
-                if isinstance(nested, list):
-                    candidates.extend(
-                        [item for item in nested if isinstance(item, dict)]
-                    )
-                elif isinstance(nested, dict):
-                    candidates.append(nested)
-        elif isinstance(payload, list):
-            candidates.extend([item for item in payload if isinstance(item, dict)])
-
-        for candidate in candidates:
+        for candidate in ImageStorage._candidate_dicts(payload):
             url = (
                 candidate.get("url")
                 or candidate.get("image_url")
@@ -99,7 +94,6 @@ class ImageStorage:
             )
             expires_at = candidate.get("expires_at")
             mime_type = candidate.get("mime_type") or candidate.get("content_type")
-
             identifier = (
                 candidate.get("id")
                 or candidate.get("image_id")
@@ -130,98 +124,146 @@ class ImageStorage:
             if url:
                 return url, expires_at, mime_type
             if identifier:
-                fallback_path = REMOTE_IMAGE_FETCH_PATH.format(id=identifier)
-                return fallback_path, expires_at, mime_type
+                fallback = REMOTE_IMAGE_FETCH_PATH.format(id=identifier)
+                return fallback, expires_at, mime_type
 
         return None, None, None
 
-    async def save(self, data: str, mime_type: str = "image/png") -> RemoteImageInfo:
-        """
-        保存 base64 图片数据到远程存储
+    @staticmethod
+    def _build_upload_payloads(data: str, mime_type: str) -> Sequence[dict]:
+        data_url = f"data:{mime_type};base64,{data}"
+        payloads: list[dict] = [
+            {"image_base64": data, "mime_type": mime_type},
+            {"image": data, "mime_type": mime_type},
+            {"image": data_url, "mime_type": mime_type},
+            {"image_base64": data},
+            {"image": data_url},
+        ]
 
-        Args:
-            data: base64 编码的图片数据
-            mime_type: MIME 类型
-
-
-        Returns:
-
-            RemoteImageInfo: 远程图片信息
-
-        """
-        upload_url = self._build_url(REMOTE_IMAGE_UPLOAD_PATH)
-        payload = {
+        metadata = {
+            "success": True,
             "image_base64": data,
             "mime_type": mime_type,
+            "is_valid_base64": True,
+            "extraction_note": "proxy",
         }
 
-        client = await self._get_client()
         try:
-            response = await client.post(upload_url, json=payload)
-            response.raise_for_status()
-        except httpx.HTTPError as exc:
-            logger.error("上传图片到远程服务失败: %s", exc)
-            raise
+            decoded_len = len(base64.b64decode(data, validate=True))
+        except Exception:  # noqa: BLE001
+            decoded_len = None
 
+        if decoded_len is not None:
+            metadata["data_length"] = decoded_len
+
+        payloads.append(metadata)
+        return payloads
+
+    @staticmethod
+    def _parse_json_stream(response: httpx.Response) -> object:
         try:
-            json_payload = response.json()
+            return response.json()
         except ValueError as exc:
-            text_body = response.text
+            text = response.text
             decoder = json.JSONDecoder()
             fragments: list[object] = []
-            idx = 0
-            length = len(text_body)
-            while idx < length:
-                while idx < length and text_body[idx].isspace():
-                    idx += 1
-                if idx >= length:
+            index = 0
+            length = len(text)
+
+            while index < length:
+                while index < length and text[index].isspace():
+                    index += 1
+                if index >= length:
                     break
                 try:
-                    obj, offset = decoder.raw_decode(text_body, idx)
+                    obj, offset = decoder.raw_decode(text, index)
                 except json.JSONDecodeError:
-                    idx += 1
+                    index += 1
                     continue
                 fragments.append(obj)
-                idx = offset
+                index = offset
+
             if fragments:
-                json_payload = fragments if len(fragments) > 1 else fragments[0]
-                logger.warning("远程服务返回非标准 JSON，已拆分解析: %s", exc)
-            else:
-                logger.error("远程服务返回非 JSON 数据: %s", exc)
-                raise
+                logger.warning(
+                    "Non-standard JSON response parsed into %d fragments: %s",
+                    len(fragments),
+                    exc,
+                )
+                return fragments if len(fragments) > 1 else fragments[0]
 
-        url, expires_at_raw, remote_mime = self._extract_remote_entry(json_payload)
+            logger.error("Unable to parse JSON response: %s", exc)
+            raise
+
+    async def save(self, data: str, mime_type: str = "image/png") -> RemoteImageInfo:
+        """Upload base64-encoded image to the remote service."""
+        upload_url = self._build_url(REMOTE_IMAGE_UPLOAD_PATH)
+        payload_variants = self._build_upload_payloads(data, mime_type)
+        client = await self._get_client()
+
+        response: Optional[httpx.Response] = None
+        last_exception: Optional[Exception] = None
+        last_error: Optional[str] = None
+
+        for payload in payload_variants:
+            try:
+                candidate = await client.post(upload_url, json=payload)
+            except httpx.HTTPError as exc:
+                last_exception = exc
+                last_error = str(exc)
+                logger.error(
+                    "Upload attempt failed with exception (payload keys=%s): %s",
+                    list(payload.keys()),
+                    exc,
+                )
+                continue
+
+            if candidate.status_code >= 400:
+                preview = candidate.text[:500]
+                last_error = f"{candidate.status_code}: {preview}"
+                logger.warning(
+                    "Upload attempt rejected (payload keys=%s): %s",
+                    list(payload.keys()),
+                    preview,
+                )
+                continue
+
+            response = candidate
+            break
+
+        if response is None:
+            if last_exception is not None:
+                raise last_exception
+            raise RuntimeError(f"Upload failed: {last_error or 'unknown error'}")
+
+        payload = self._parse_json_stream(response)
+        url, expires_at_raw, remote_mime = self._extract_remote_entry(payload)
         if not url:
-            logger.error("远程服务返回中缺少 URL 字段: %s", json_payload)
-            raise RuntimeError("远程图片服务返回数据无效")
+            logger.error("Remote response missing URL field: %s", payload)
+            raise RuntimeError("Remote image service returned invalid data")
 
-        full_url = self._build_url(url)
-        image_id = full_url.rstrip("/").split("/")[-1]
-
-        expires_at = self._parse_expires_at(expires_at_raw)
-        if expires_at is None:
-            expires_at = time.time() + IMAGE_EXPIRE_SECONDS
+        resolved_url = self._build_url(url)
+        image_id = resolved_url.rstrip("/").split("/")[-1]
+        expires_at = self._parse_expires_at(expires_at_raw) or (
+            time.time() + IMAGE_EXPIRE_SECONDS
+        )
 
         info = RemoteImageInfo(
             id=image_id,
-            url=full_url,
+            url=resolved_url,
             mime_type=remote_mime or mime_type,
             expires_at=expires_at,
         )
         self._images[image_id] = info
 
         logger.info(
-            "图片已上传至远程服务: %s (过期时间: %s)", image_id, expires_at_raw or "N/A"
+            "Image uploaded to remote storage: %s (expires: %s)",
+            image_id,
+            expires_at_raw or "N/A",
         )
-
         return info
 
     async def get(self, image_id: str) -> Optional[tuple[bytes, str]]:
-        """
-        获取图片数据
-        Returns:
-            (图片字节数据, MIME类型) 或 None
-        """
+        """Retrieve image bytes from remote service."""
         info = self._images.get(image_id)
         fetch_url = (
             info.url
@@ -233,37 +275,41 @@ class ImageStorage:
         try:
             response = await client.get(fetch_url)
         except httpx.HTTPError as exc:
-            logger.error("获取远程图片失败 %s: %s", image_id, exc)
+            logger.error("Failed to fetch remote image %s: %s", image_id, exc)
             return None
 
         if response.status_code != 200:
             logger.warning(
-                "远程图片未找到或已过期 %s，状态码: %s", image_id, response.status_code
+                "Remote image unavailable %s (status %s)",
+                image_id,
+                response.status_code,
             )
-            if image_id in self._images:
-                del self._images[image_id]
+            self._images.pop(image_id, None)
             return None
 
         content_type = response.headers.get("content-type", "image/png")
         if info and content_type != info.mime_type:
             info.mime_type = content_type
+
         return response.content, content_type
 
     async def cleanup_expired(self) -> None:
-        """清理远程已过期的缓存映射"""
+        """Remove cached mappings that have passed their expiration."""
         now = time.time()
         expired = [
             image_id
             for image_id, info in self._images.items()
             if info.expires_at is not None and now > info.expires_at
         ]
+
         for image_id in expired:
             del self._images[image_id]
+
         if expired:
-            logger.info("清理了 %d 个远程图片缓存映射", len(expired))
+            logger.info("Cleaned up %d expired remote image references", len(expired))
 
     async def start_cleanup_scheduler(self) -> None:
-        """启动定期清理任务"""
+        """Start periodic cleanup task."""
 
         async def _scheduler() -> None:
             while True:
@@ -271,14 +317,17 @@ class ImageStorage:
                 try:
                     await self.cleanup_expired()
                 except Exception as exc:  # noqa: BLE001
-                    logger.error("定期清理失败: %s", exc)
+                    logger.error("Scheduled cleanup failed: %s", exc)
 
         if self._cleanup_task is None or self._cleanup_task.done():
             self._cleanup_task = asyncio.create_task(_scheduler())
-            logger.info("图片清理调度器已启动，间隔: %s秒", IMAGE_CLEANUP_INTERVAL)
+            logger.info(
+                "Remote image cleanup scheduler started (interval=%ss)",
+                IMAGE_CLEANUP_INTERVAL,
+            )
 
     async def stop_cleanup_scheduler(self) -> None:
-        """停止定期清理任务"""
+        """Stop periodic cleanup task and close HTTP client."""
         if self._cleanup_task:
             self._cleanup_task.cancel()
             try:
@@ -286,12 +335,12 @@ class ImageStorage:
             except asyncio.CancelledError:
                 pass
             self._cleanup_task = None
-            logger.info("图片清理调度器已停止")
+            logger.info("Remote image cleanup scheduler stopped")
 
         if self._client:
             await self._client.aclose()
             self._client = None
 
 
-# 全局实例
+# Shared instance
 image_storage = ImageStorage()
