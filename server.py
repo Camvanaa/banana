@@ -517,9 +517,9 @@ async def chat_completions(request: Request, body: ChatCompletionRequest):
             except Exception as exc:
                 logger.error("Upstream task error: %s", exc)
 
-        request.app.state.setdefault("background_tasks", set()).add(
-            asyncio.create_task(cleanup_task())
-        )
+        if not hasattr(request.app.state, "background_tasks"):
+            request.app.state.background_tasks = set()
+        request.app.state.background_tasks.add(asyncio.create_task(cleanup_task()))
 
         return response
 
