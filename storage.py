@@ -88,10 +88,17 @@ class ImageStorage:
 
         if not info:
             # 尝试从文件系统查找
-            for file_path in IMAGE_DIR.glob(f"{image_id}.*"):
+            logger.info(f"内存中未找到 {image_id}，尝试从文件系统查找: {IMAGE_DIR}")
+            found_files = list(IMAGE_DIR.glob(f"{image_id}.*"))
+            logger.info(f"找到文件: {found_files}")
+
+            for file_path in found_files:
                 if file_path.exists():
                     mime_type = self._guess_mime_type(file_path.suffix)
+                    logger.info(f"从文件系统加载图片: {file_path}")
                     return file_path.read_bytes(), mime_type
+
+            logger.warning(f"图片未找到: {image_id}")
             return None
 
         if not info.path.exists():
